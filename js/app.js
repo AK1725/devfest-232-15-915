@@ -532,35 +532,70 @@ function tokenize(s){
   return s.toLowerCase().replace(/[^a-z0-9\s]+/g, " ").split(/\s+/).filter(x => x.length > 2);
 }
 
+/** Two words count as the same idea if they share a four-letter stem
+ *  ("certificate" ≈ "cert"), so file names need not match titles exactly. */
+function tokenMatch(a, b){
+  if (a === b) return true;
+  if (a.length >= 4 && b.startsWith(a.slice(0, 4))) return true;
+  if (b.length >= 4 && a.startsWith(b.slice(0, 4))) return true;
+  return false;
+}
+
+/** A year in the file name breaks ties: a 2026 licence beats a 2025 one. */
+function yearIn(name){
+  const found = name.match(/(?:19|20)\d{2}/g);
+  return found ? Math.max(...found.map(Number)) : 0;
+}
+
+/** Rank every requirement/file pairing, then assign the strongest first.
+ *  Scoring every pair up front stops an early, weak requirement from
+ *  stealing a file that a later requirement matches far better. */
 function autoMatch(){
-  const dupes = duplicateIds();
-  const seenHash = hashesInUse(null);
-  let count = 0;
+  const taken = new Set();
+  const takenHashes = new Set();
+  for (const fileId of Object.values(state.matches)){
+    taken.add(fileId);
+    const f = fileById(fileId);
+    if (f && f.hash) takenHashes.add(f.hash);
+  }
+
+  const MIN_CONFIDENCE = 0.5;   // at least half the words in the title
+  const pairs = [];
 
   for (const r of state.requirements){
     if (state.matches[r.id]) continue;
-    const wanted = tokenize(r.title_en || "");
+    const wanted = tokenize(r.title_en || r.title_bn || "");
     if (!wanted.length) continue;
 
-    let best = null, bestScore = 0;
     for (const f of state.files){
       if (!f.ok) continue;
-      if (reqUsingFile(f.id)) continue;
-      if (f.hash && seenHash.has(f.hash)) continue;
-
       const have = tokenize(f.name.replace(/\.pdf$/i, ""));
-      let score = 0;
+      let hits = 0;
       for (const token of wanted){
-        if (have.some(h => h.startsWith(token.slice(0, 4)) || token.startsWith(h.slice(0, 4)))) score++;
+        if (have.some(h => tokenMatch(token, h))) hits++;
       }
-      if (score > bestScore){ bestScore = score; best = f; }
+      const confidence = hits / wanted.length;
+      if (confidence >= MIN_CONFIDENCE){
+        pairs.push({ req: r, file: f, confidence, hits, year: yearIn(f.name) });
+      }
     }
+  }
 
-    if (best && bestScore >= 1){
-      state.matches[r.id] = best.id;
-      if (best.hash) seenHash.add(best.hash);
-      count++;
-    }
+  pairs.sort((a, b) =>
+    b.confidence - a.confidence ||
+    b.hits - a.hits ||
+    b.year - a.year);
+
+  let count = 0;
+  for (const p of pairs){
+    if (state.matches[p.req.id]) continue;
+    if (taken.has(p.file.id)) continue;
+    if (p.file.hash && takenHashes.has(p.file.hash)) continue;
+
+    state.matches[p.req.id] = p.file.id;
+    taken.add(p.file.id);
+    if (p.file.hash) takenHashes.add(p.file.hash);
+    count++;
   }
 
   renderAll();
